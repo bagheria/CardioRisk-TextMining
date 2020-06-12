@@ -5,4 +5,4 @@ Aim of this project is to develop and evaluate a text-mining pipeline to show th
 
 To exploit the potential information capturedin EHRs, in this study we propose a multimodal recurrentneural network model for cardiovascular risk prediction thatintegrates both medical texts and structured clinical information.
 
-![alt text](Documents/BiLSTM model.pdf)
+![alt text](https://github.com/bagheria/CardioRisk-TextMining/blob/master/Documents/BiLSTM%20model.pdf)
