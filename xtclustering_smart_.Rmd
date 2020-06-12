@@ -1,0 +1,630 @@
+---
+title: "xtclustering-smart"
+authors: "Ayoub Bagheri, Katrien Groenhof"
+output: html_document
+editor_options: 
+chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+## Load libraries
+
+```{r}
+library(xlsx)
+library(dplyr)
+library(topicmodels)
+library(tidytext)
+library(ggplot2)
+library(tm)
+library(stringr)
+library(skimr)
+library(magrittr)
+library(glmnet)
+library(qdap)
+library(caret)
+library(pROC)
+library(wordcloud)
+library(mice)
+library(ROCR)
+library(tidyr)
+library(text2vec)
+library(readr)
+
+```
+
+# 1 Exploratory data analysis
+
+## Reading data
+
+```{r}
+XTSMARTsmall <- 
+  read.xlsx("/Data/file.xlsx", 1)
+
+```
+
+## NA values
+```{r}
+# skim(XTSMARTsmall$MACEstat)
+na_index <- is.na(XTSMARTsmall$MACEstat)
+X <- XTSMARTsmall[!na_index, ]
+# skim(X)
+
+```
+
+## X-ray reports
+```{r}
+corpus <- str_replace_all(as.character(X$Report), "<br>", " ")
+corpus <- gsub("\\b[[:alnum:]]{15,}\\b", "", corpus, perl = T)
+data   <- data.frame(PID  = X$Studienr, 
+                     text = corpus,
+                     cvd  = X$MACEstat)
+# Y_training <- as.factor(data$cvd)
+
+```
+
+## Text analysis
+```{r}
+frequent_terms <- freq_terms(data$text, top = 30)
+
+ggplot(frequent_terms, aes(x = reorder(WORD, FREQ), y = FREQ)) + 
+  geom_bar(stat = "identity") + 
+  coord_flip()                + 
+  xlab("Word in Corpus")      + 
+  ylab("Count")               +
+  theme_minimal()
+
+# wordcloud(data$text, min.freq = 10, random.order = FALSE, 
+#          colors = brewer.pal(8, "Dark2"))
+
+```
+
+## Spliting text on "thorax": Part1 + Part2
+```{r}
+# data.p2 <- data
+# data.p2$text <- substring(data.p2$text, 
+#                           regexpr("thorax", data.p2$text) + 7)
+
+```
+
+## Text preprocessing: cleaning function
+```{r}
+clean_text  <- function(text){
+  text      <- tolower(text)
+  text      <- gsub("[[:punct:][:blank:]]+", " ", text)
+  text      <- stripWhitespace(text)
+  text      <- removeNumbers(text)
+  text      <- removePunctuation(text)
+  # create a customized stop list by editting the stop.txt file
+  new_stops <- read.table("stop.txt", header = TRUE)
+  new_stops <- as.vector(new_stops$CUSTOM_STOP_WORDS)
+  text      <- removeWords(text, new_stops)
+  return(text)
+  }
+
+```
+
+## Apply the cleaning function
+```{r}
+data$text <- clean_text(data$text)
+
+```
+
+## Top frequent terms after applying the cleaning function
+```{r}
+frequent_terms_p <- freq_terms(data$text, top = 20)
+
+frequent_terms_p %>% ggplot(aes(x = reorder(WORD, FREQ), y = FREQ)) + 
+  geom_bar(stat = "identity") + 
+  coord_flip()                + 
+  xlab("Word in Corpus")      + 
+  ylab("Count")               +
+  theme_minimal()
+
+```
+
+## Stemming: porter stemmer
+```{r}
+# data$text <- stemDocument(data$text, language = "dutch")
+
+```
+
+## Top frequent terms after stemming
+```{r}
+# frequent_terms_s <- freq_terms(data$text, top = 30)
+
+# ggplot(frequent_terms_s, aes(x = reorder(WORD, FREQ), y = FREQ)) + 
+#  geom_bar(stat = "identity") + 
+#  coord_flip()                + 
+#  xlab("Word in Corpus")      + 
+#  ylab("Count")               +
+#  theme_minimal()
+
+```
+
+
+# 2 Experiments
+
+```{r}
+# Baseline data
+V <- X %>% 
+  select(MACEstat, AGE, SEX, SMOKING, SYST, DM,
+         HDL, TOTCHOLEST, Mdrd, EVERcvd,
+         EVERstroke, EVERpad, EVERaaa, YrSinceDiagnosisCVD)
+V <- V %>% mice(m = 1, maxit = 1)
+X_baseline <- mice::complete(V, 1)
+X_baseline <- 
+  X_baseline %>% 
+  mutate(AGE  = log10(AGE / 10),
+         SYST = SYST / 100,
+         Mdrd = Mdrd / 100,
+         TOTCHOLEST = log10(TOTCHOLEST),
+         YrSinceDiagnosisCVD = YrSinceDiagnosisCVD / 50)
+
+```
+
+## Remove empty text
+```{r}
+for (i in 1:dim(data)[1]){
+  space_text <- space_tokenizer(data$text[i])[[1]]
+  if(length(space_text) <= 2){
+    print(data$text[i])
+    data <- data[-c(i), ]
+    X_baseline <- X_baseline[-c(i), ]
+  }
+}
+
+```
+
+## test and train
+```{r}
+smp_size   <- floor(0.8 * nrow(X_baseline))
+train_ind  <- sample(seq_len(nrow(X_baseline)), size = smp_size)
+train_base <- X_baseline[train_ind, ]
+test_base  <- X_baseline[-train_ind, ]
+table(train_base$MACEstat)
+table(test_base$MACEstat)
+
+# for text
+train_text <- data[train_ind, ]
+test_text  <- data[-train_ind, ]
+
+```
+
+## data for deep learning
+```{r}
+xbo_dl <- cbind(X_baseline, text = data$text)
+write.csv(xbo_dl, file = 'xbo.csv')
+# write.csv(X_training_BOW, file = 'xbow.csv')
+
+```
+
+## Text representation: bag of words
+```{r}
+vc  <- VCorpus(VectorSource(data$text))
+dtm <- DocumentTermMatrix(vc)
+
+```
+
+## Data: cvd ~ clinical_variables + bag_of_words
+```{r}
+# X_training_BOW <- cbind(X_training_baseline, as.matrix(dtm))
+# train and test
+dtm         <- as.matrix(dtm)
+train_dtm   <- dtm[train_ind, ]
+test_dtm    <- dtm[-train_ind, ]
+
+x_train_bow <- cbind(train_base, as.matrix(train_dtm))
+x_test_bow  <- cbind(test_base, as.matrix(test_dtm))
+
+```
+
+------------------------------------------------------------------------------------
+## 2.1 Baseline: train models with clinical variables: MACEstat ~ clinical_variables
+## 2.1.1 GLM + cv
+```{r}
+set.seed(321)
+cv.fit <- cv.glmnet(data.matrix(train[, -1]),
+                    data.matrix(train[, 1]),
+                    family = "binomial",
+                    type.measure = "class", 
+                    nfolds = 5)
+
+pred <- predict(cv.fit, 
+                newx = data.matrix(test[, -1]), 
+                type = 'response',s ="lambda.min")
+pr   <- prediction(pred, data.matrix(test[, 1]))
+
+auc1  <- performance(pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res1 <- tibble(
+  "model" = "baseLR",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+## 2.1.2 SVM + cv
+```{r}
+set.seed(321)
+# X_training_baseline[,"MACEstat"] <- factor(X_training_baseline[,"MACEstat"])
+# levels(X_training_baseline[,"MACEstat"]) <- c("first_class", "second_class")
+
+TrainCtrl <- trainControl(method  = "cv", 
+                          number  = 5,
+                          classProbs = TRUE,
+                          savePred = TRUE,
+                          verbose = FALSE)
+
+Svm_model <- train(MACEstat ~.,
+                    data = train,
+                    method     = "svmLinearWeights2", 
+                    trControl  = TrainCtrl,
+                    metric = "Accuracy",
+                    # tuneGrid = SVMgrid, 
+                    verbose = FALSE)
+
+PredictedTest <- predict(Svm_model, test[, -1])
+pr   <- prediction(as.numeric(PredictedTest), as.numeric(test[, 1]))
+
+auc1  <- performance(pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res2 <- tibble(
+  "model" = "baseSVM",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+-------------------------------
+# 2.2 Clinical variables + BOW
+## 2.2.1 Logistic regression + regularization + cv
+```{r}
+set.seed(321)
+bow.cv.fit <- cv.glmnet(data.matrix(X_training_BOW[, -1]), 
+                        data.matrix(X_training_BOW[, 1]),
+                        family = "binomial",
+                        type.measure = "class", 
+                        nfolds = 5)
+
+bow.pred <- predict(bow.cv.fit, 
+                    newx = data.matrix(X_training_BOW[, -1]), 
+                    type = 'response',s ="lambda.min")
+bow.pr   <- prediction(bow.pred, data.matrix(X_training_BOW[, 1]))
+
+auc1  <- performance(bow.pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(bow.pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(bow.pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res3 <- tibble(
+  "model" = "bowLR",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+## 2.2.2 SVM + cv
+```{r}
+set.seed(321)
+X_training_BOW[,"MACEstat"] <- factor(X_training_BOW[,"MACEstat"])
+levels(X_training_BOW[,"MACEstat"]) <- c("first_class", "second_class")
+
+# x_test_bow[,"MACEstat"] <- factor(x_test_bow[,"MACEstat"])
+# levels(x_test_bow[,"MACEstat"]) <- c("first_class", "second_class")
+
+TrainCtrl <- trainControl(method     = "cv", 
+                          number     = 5,
+                          classProbs = TRUE,
+                          savePred   = TRUE,
+                          verbose    = FALSE)
+
+Svm_model2 <- train(MACEstat ~.,
+                    data       = X_training_BOW,
+                    method     = "svmLinearWeights2",
+                    trControl  = TrainCtrl,
+                    metric     = "Accuracy",
+                    # tuneGrid = SVMgrid, 
+                    verbose    = FALSE)
+
+PredictedTest <- predict(Svm_model2, X_training_BOW[, -1])
+
+pr    <- prediction(as.numeric(PredictedTest), as.numeric(X_training_BOW[, 1]))
+auc1  <- performance(pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res4 <- tibble(
+  "model" = "bowSVM",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+--------------------------------------------------------------------
+# 2.3 Clinical variables + clusters
+
+## Define show_top_terms function: Using Clustering results as predictors
+```{r}
+show_top_terms <- function(out_lda, n = 15){
+  ap_topics    <- tidy(out_lda, matrix = "beta")
+  
+  ap_top_terms <- ap_topics %>%
+    group_by(topic)         %>%
+    top_n(n, beta)          %>%
+    ungroup()               %>%
+    arrange(topic, -beta)
+  
+  ap_top_terms %>%
+    mutate(term = reorder(term, beta)) %>%
+    ggplot(aes(term, beta, fill = factor(topic))) +
+    geom_col(show.legend = FALSE)                 +
+    facet_wrap(~ topic, scales = "free")          +
+    coord_flip()
+}
+
+```
+
+## Clustering with Latent Dirichlet Allocation
+```{r}
+# Need to have different experiments with different K values
+ap_lda <- LDA(dtm, 
+              k = 10, 
+              method = "Gibbs",
+              control = list(seed = 321))
+
+show_top_terms(ap_lda, n = 20)
+
+```
+
+## Document-topic probabilities from LDA
+```{r}
+ap_documents <- tidy(ap_lda, matrix = "gamma")
+
+```
+
+## Creating a dataframe for topic clusters
+```{r}
+gamma_spread   <- ap_documents           %>% 
+  mutate(topic = paste0("topic", topic)) %>% 
+  spread(topic, gamma)
+
+gamma_spread <- gamma_spread[order(as.integer(gamma_spread$document)),]
+
+```
+
+## Data: cvd ~ clinical_variables + clusters
+```{r}
+X_training_clustering <- cbind(X_baseline, select(gamma_spread, -document))
+
+```
+
+## 2.3.1 Logistic regression + regularization + cv
+```{r}
+set.seed(321)
+cluster.cv.fit <- cv.glmnet(data.matrix(X_training_clustering[, -1]), 
+                            data.matrix(X_training_clustering[, 1]),
+                            family = "binomial",
+                            type.measure = "class", 
+                            nfolds = 5)
+
+cluster.pred <- predict(cluster.cv.fit, 
+                        newx = data.matrix(X_training_clustering[, -1]), 
+                        type = 'response',s ="lambda.min")
+
+cluster.pr   <- prediction(cluster.pred, data.matrix(X_training_clustering[, 1]))
+
+auc1  <- performance(cluster.pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(cluster.pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(cluster.pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res5 <- tibble(
+  "model" = "clusterLR",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+## 2.3.2 SVM + cv
+```{r}
+set.seed(321)
+X_training_clustering[,"MACEstat"] <- factor(X_training_clustering[,"MACEstat"])
+levels(X_training_clustering[,"MACEstat"]) <- c("first_class", "second_class")
+
+TrainCtrl <- trainControl(method  = "cv", 
+                          number  = 5,
+                          classProbs = TRUE,
+                          savePred = TRUE,
+                          verbose = FALSE)
+
+Svm_model3 <- train(MACEstat ~.,
+                    data = X_training_clustering,
+                    method     = "svmLinearWeights2", 
+                    trControl  = TrainCtrl,
+                    metric = "Accuracy",
+                    # tuneGrid = SVMgrid, 
+                    verbose = FALSE)
+
+PredictedTest <- predict(Svm_model3, X_training_clustering[, -1])
+pr   <- prediction(as.numeric(PredictedTest), as.numeric(X_training_clustering[, 1]))
+
+auc1  <- performance(pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res6 <- tibble(
+  "model" = "clusterSVM",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+-----------------------------------------
+# 2.4 Clinical variables + word embedding
+
+## Creating word vectors with GLOVE
+```{r}
+textWiki <- paste(data$text, collapse = " ")
+
+# Create iterator over tokens
+tokens <- space_tokenizer(textWiki)
+
+# Create vocabulary. Terms will be unigrams (simple words).
+it = itoken(tokens, progressbar = FALSE)
+vocab <- create_vocabulary(it)
+vocab <- prune_vocabulary(vocab, term_count_min = 5L)
+
+# Use our filtered vocabulary
+vectorizer <- vocab_vectorizer(vocab)
+
+# use window of 5 for context words
+embedding_size <- 300
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+glove <- GlobalVectors$new(word_vectors_size = embedding_size, vocabulary = vocab, x_max = 10)
+glove_main_wv <- glove$fit_transform(tcm, n_iter = 2)
+components_wv <- glove$components
+word_vectors <- glove_main_wv + t(components_wv)
+
+# word_vectors["hart", ]
+
+```
+
+## Aggregating word vectors for each report
+```{r}
+is.there <- function(x) x %in% vocab$term
+
+text_vecotrs <- data.frame(matrix(0, nrow = dim(data)[1], ncol = embedding_size))
+
+for (i in 1:dim(data)[1]){
+  space_text <- space_tokenizer(data$text[i])
+  length(space_text[[1]])
+  words_in_text <- space_text[[1]][which(is.there(space_text[[1]]))]
+  if(length(words_in_text) == 0)
+    next
+  else if(length(words_in_text) == 1)
+    text_vecotrs[i, ] <- word_vectors[words_in_text, ]
+  else
+    text_vecotrs[i, ] <- colMeans(word_vectors[words_in_text, ])
+}
+
+```
+
+## Data: cvd ~ clinical_variables + word_embedding
+```{r}
+X_training_WE <- cbind(X_baseline, text_vecotrs)
+
+```
+
+## 2.4.1 Logistic regression + regularization + cv
+```{r}
+set.seed(321)
+we.cv.fit <- cv.glmnet(data.matrix(X_training_WE[, -1]),
+                       data.matrix(X_training_WE[, 1]),
+                       family = "binomial",
+                       type.measure = "class", 
+                       nfolds = 5)
+
+we.pred <- predict(we.cv.fit, 
+                   newx = data.matrix(X_training_WE[, -1]), 
+                   type = 'response',
+                   s ="lambda.min")
+
+we.pr <- prediction(we.pred, data.matrix(X_training_WE[, 1]))
+auc1  <- performance(we.pr, measure = "auc")
+auc1  <- auc1@y.values[[1]]
+f1 <- performance(we.pr, measure = "f")
+f1_max_index <- which.max(na.omit(f1@y.values[[1]]))
+err1 <- performance(we.pr, measure = "err")
+err1 <- min(na.omit(err1@y.values[[1]]))
+
+res7 <- tibble(
+  "model" = "w2vLR",
+  "auc" = auc1,
+  "f1-score" = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+## 2.4.2 SVM + cv
+```{r}
+set.seed(321)
+X_training_WE[,"MACEstat"] <- factor(X_training_WE[,"MACEstat"])
+levels(X_training_WE[,"MACEstat"]) <- c("first_class", "second_class")
+
+TrainCtrl <- trainControl(method  = "cv", 
+                          number  = 5,
+                          classProbs = TRUE,
+                          savePred = TRUE,
+                          verbose = FALSE)
+
+Svm_model4 <- train(MACEstat ~.,
+                    data = X_training_WE,
+                    method     = "svmLinearWeights2", 
+                    trControl  = TrainCtrl,
+                    metric = "Accuracy",
+                    # tuneGrid = SVMgrid, 
+                    verbose = FALSE)
+
+PredictedTest <- predict(Svm_model4, X_training_WE[, -1])
+pr            <- prediction(as.numeric(PredictedTest), as.numeric(X_training_WE[, 1]))
+
+auc1          <- performance(pr, measure = "auc")
+auc1          <- auc1@y.values[[1]]
+f1            <- performance(pr, measure = "f")
+f1_max_index  <- which.max(na.omit(f1@y.values[[1]]))
+err1          <- performance(pr, measure = "err")
+err1          <- min(na.omit(err1@y.values[[1]]))
+
+res8 <- tibble(
+  "model"                  = "w2vSVM",
+  "auc"                    = auc1,
+  "f1-score"               = na.omit(f1@y.values[[1]])[f1_max_index],
+  "misclassification rate" = err1
+  )
+
+```
+
+```{r}
+results_tab <- rbind(res1, res2, res3, res4,
+                     res5, res6, res7, res8)
+
+```
+
+
